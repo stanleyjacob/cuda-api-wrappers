@@ -31,10 +31,9 @@
 #include <cuda/api/current_device.hpp>
 #include <cuda/api/error.hpp>
 #include <cuda/api/pointer.hpp>
-#include <cuda_runtime.h> // needed, rather than cuda_runtime_api.h, e.g. for cudaMalloc
 
-#include <memory>
-#include <cstring> // for std::memset
+#include <cuda_runtime.h> // needed, rather than cuda_runtime_api.h, e.g. for cudaMalloc
+#include <cuda.h>
 
 #include <memory>
 #include <cstring> // for std::memset
@@ -58,9 +57,15 @@ struct region_t {
 	void* start;
 	size_t size_in_bytes;
 
-	size_t size() const { return size_in_bytes; }
-	void* data() const { return start; }
-	void* get() const { return start; }
+	size_t const & size() const { return size_in_bytes; }
+	void * const & data() const { return start; }
+	void * const & get()  const { return start; }
+
+	size_t       & size()       { return size_in_bytes; }
+	void *       & data()       { return start; }
+	void *       & get()        { return start; }
+
+	CUdeviceptr device_ptr() const noexcept { return reinterpret_cast<CUdeviceptr>(start); }
 };
 
 /**
@@ -247,6 +252,32 @@ inline void set(region_t region, int byte_value)
 }
 ///@}
 
+/**
+ * @brief Sets consecutive elements of a region of memory to a fixed
+ * value of some width
+ *
+ * @note Similar to `set()`, but with with the width constraint.
+ *
+ * @param value An unsigned integral value, properly aligned!
+ */
+template <typename T>
+inline void typed_set(T* start, const T& value, size_t num_elements)
+{
+	static_assert(std::is_trivially_copyable<T>::value, "Non-trivially-copyable types cannot be used for setting memory");
+	static_assert(
+		sizeof(T) == 1 or sizeof(T) == 2 or
+		sizeof(T) == 4 or sizeof(T) == 8,
+		"Unsupported type size - only sizes 1, 2 and 4 are supported");
+	// TODO: Consider checking for alignment when compiling without NDEBUG
+	CUresult result {CUDA_SUCCESS};
+	switch(sizeof(T)) {
+	case(1): result = cuMemsetD8 (address(start), reinterpret_cast<const std::uint8_t& >(value), num_elements); break;
+	case(2): result = cuMemsetD16(address(start), reinterpret_cast<const std::uint16_t&>(value), num_elements); break;
+	case(4): result = cuMemsetD32(address(start), reinterpret_cast<const std::uint32_t&>(value), num_elements); break;
+	}
+	throw_if_error(result, "Setting global device memory bytes");
+	return;
+}
 
 /**
  * @brief Sets all bytes in a region of memory to 0 (zero)
@@ -720,26 +751,22 @@ namespace async {
 
 namespace detail {
 
-inline void set(void* start, int byte_value, size_t num_bytes, stream::id_t stream_id)
-{
+inline void set(void *start, int byte_value, size_t num_bytes, stream::id_t stream_id) {
 	// TODO: Double-check that this call doesn't require setting the current device
 	auto result = cudaMemsetAsync(start, byte_value, num_bytes, stream_id);
 	throw_if_error(result, "asynchronously memsetting an on-device buffer");
 }
 
-inline void set(region_t region, int byte_value, stream::id_t stream_id)
-{
+inline void set(region_t region, int byte_value, stream::id_t stream_id) {
 	set(region.start, byte_value, region.size_in_bytes, stream_id);
 }
 
 
-inline void zero(void* start, size_t num_bytes, stream::id_t stream_id)
-{
+inline void zero(void *start, size_t num_bytes, stream::id_t stream_id) {
 	set(start, 0, num_bytes, stream_id);
 }
 
-inline void zero(region_t region, stream::id_t stream_id)
-{
+inline void zero(region_t region, stream::id_t stream_id) {
 	zero(region.start, region.size_in_bytes, stream_id);
 }
 
@@ -756,7 +783,7 @@ inline void zero(region_t region, stream::id_t stream_id)
  * @param num_bytes size of the memory region in bytes
  * @param stream stream on which to schedule this action
  */
-inline void set(void* start, int byte_value, size_t num_bytes, const stream_t& stream);
+inline void set(void *start, int byte_value, size_t num_bytes, const stream_t &stream);
 
 /**
  * Similar to @ref set(), but sets the memory to zero rather than an arbitrary value
@@ -772,13 +799,88 @@ inline void zero(void* start, size_t num_bytes, const stream_t& stream);
  * @param ptr a pointer to the value to be to zero
  * @param stream stream on which to schedule this action
  */
-template <typename T>
-inline void zero(T* ptr, const stream_t& stream)
-{
+template<typename T>
+inline void zero(T *ptr, const stream_t &stream) {
 	zero(ptr, sizeof(T), stream);
 }
 
 } // namespace async
+
+namespace peer_to_peer {
+
+namespace detail {
+
+inline void copy(
+    void *             destination_address,
+    context::handle_t  destination_context,
+    const void *       source_address,
+    context::handle_t  source_context,
+    size_t             num_bytes)
+{
+    static_assert(sizeof(void *) == sizeof(CUdeviceptr), "Unexpected address size");
+    auto status = cuMemcpyPeer(
+            reinterpret_cast<CUdeviceptr>(destination_address),
+            destination_context,
+            reinterpret_cast<CUdeviceptr>(source_address),
+            source_context, num_bytes);
+    throw_if_error(status,
+        std::string("Failed copying data between devices: From address ")
+		+ cuda::detail::ptr_as_hex(source_address) + " in context "
+		+ cuda::detail::ptr_as_hex(source_context) + " to address "
+		+ cuda::detail::ptr_as_hex(destination_address) + " in context "
+		+ cuda::detail::ptr_as_hex(destination_context) );
+}
+
+} // namespace detail
+
+inline void copy(
+    void *             destination_address,
+    const context_t&   destination_context,
+    const void *       source_address,
+    const context_t&   source_context,
+    size_t             num_bytes);
+
+namespace async {
+
+namespace detail {
+
+inline void copy(
+    stream::id_t       stream_id,
+    void *             destination_address,
+    context::handle_t  destination_context,
+    const void *       source_address,
+    context::handle_t  source_context,
+    size_t             num_bytes)
+{
+    static_assert(sizeof(void *) == sizeof(CUdeviceptr), "Unexpected address size");
+    auto status = cuMemcpyPeerAsync(
+        reinterpret_cast<CUdeviceptr>(destination_address),
+        destination_context,
+        reinterpret_cast<CUdeviceptr>(source_address),
+        source_context,
+        num_bytes,
+        stream_id);
+    throw_if_error(status,
+        std::string("Failed copying data between devices: From address ")
+		+ cuda::detail::ptr_as_hex(source_address) + " in context "
+		+ cuda::detail::ptr_as_hex(source_context) + " to address "
+		+ cuda::detail::ptr_as_hex(destination_address) + " in context "
+		+ cuda::detail::ptr_as_hex(destination_context) );
+}
+
+} // namespace async
+
+inline void copy(
+    void *             destination_address,
+    const context_t&   destination_context,
+    const void *       source_address,
+    const context_t&   source_context,
+    size_t             num_bytes,
+    const stream_t&    stream);
+
+} // namespace peer_to_peer
+
+} // namespace device
 
 } // namespace device
 
@@ -1040,9 +1142,22 @@ struct region_t : public memory::region_t {
 		detail::set_scalar_range_attribute(*this, cudaMemAdviseUnsetReadMostly);
 	}
 
+	/**
+	 * @note May return `cuda::device::cpu()`.
+	 *
+	 * @note May also return a device wrapping `cudaInvalidDeviceId` - and that is currently not handled explicitly, so be careful.
+	 *
+	 */
 	device_t preferred_location() const;
+
+	/**
+	 * @note: May return `cuda::device::cpu()`.
+	 */
+	device_t last_prefetch_location() const;
 	void set_preferred_location(device_t& device) const;
 	void clear_preferred_location() const;
+
+	// TODO: Last prefetch location!
 
 	void advise_expected_access_by(device_t& device) const;
 	void advise_no_access_expected_by(device_t& device) const;

@@ -41,9 +41,9 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "lib/")
 # Our library targets
 # -------------------
 
-add_library(runtime-api INTERFACE) # A header-only library!
+add_library(runtime-and-driver INTERFACE) # A header-only library!
 add_library(nvtx)
-set(wrapper-libraries runtime-api nvtx)
+set(wrapper-libraries runtime-and-driver nvtx)
 
 foreach(WRAPPER_LIB ${wrapper-libraries})
 	target_compile_features(${WRAPPER_LIB} INTERFACE cxx_std_11) # This means _at least_ C++11
@@ -57,11 +57,11 @@ foreach(WRAPPER_LIB ${wrapper-libraries})
 	# target_link_libraries(${WRAPPER_LIB} PUBLIC CUDA::CUDALibs)
 	# ... but that's not supported.
 	target_include_directories(${WRAPPER_LIB} INTERFACE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-	target_link_libraries(${WRAPPER_LIB} INTERFACE ${CUDA_LIBRARIES})
+	target_link_libraries(${WRAPPER_LIB} INTERFACE ${CUDA_LIBRARIES} ${CUDA_CUDA_LIBRARY})
 endforeach()
 
 set_target_properties(nvtx PROPERTIES OUTPUT_NAME "cuda-nvtx-wrappers")
-target_link_libraries(nvtx PUBLIC runtime-api)
+target_link_libraries(nvtx PUBLIC runtime-and-driver)
 set_property(TARGET nvtx PROPERTY CXX_STANDARD 11)
 set_property(TARGET nvtx PROPERTY CXX_STANDARD_REQUIRED ON)
 set_property(TARGET nvtx PROPERTY CXX_EXTENSIONS OFF)

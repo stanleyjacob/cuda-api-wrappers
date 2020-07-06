@@ -9,12 +9,13 @@
 #ifndef CUDA_API_WRAPPERS_DEVICE_HPP_
 #define CUDA_API_WRAPPERS_DEVICE_HPP_
 
+#include <cuda/api/types.hpp>
 #include <cuda/api/current_device.hpp>
 #include <cuda/api/device_properties.hpp>
 #include <cuda/api/memory.hpp>
 #include <cuda/api/pci_id.hpp>
 #include <cuda/api/unique_ptr.hpp>
-#include <cuda/common/types.hpp>
+#include <cuda/api/primary_context.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -23,11 +24,20 @@
 
 namespace cuda {
 
+///@cond
 class event_t;
 class stream_t;
 class device_t;
+///@endcond
 
 namespace device {
+
+///@cond
+class primary_context_t;
+///@cendond
+
+using limit_t = cudaLimit;
+using limit_value_t = size_t;
 
 /**
  * Returns a proxy for the CUDA device with a given id
@@ -120,7 +130,7 @@ attribute_value_t get_attribute(
 inline void synchronize(device_t& device);
 
 /**
- * @brief Proxy class for a CUDA device
+ * @brief Wrapper class for a CUDA device
  *
  * Use this class - built around a device ID, or for the current device - to
  * perform almost, if not all, device-related operations, as opposed to passing
@@ -128,16 +138,18 @@ inline void synchronize(device_t& device);
  *
  * @note this is one of the three main classes in the Runtime API wrapper library,
  * together with @ref cuda::stream_t and @ref cuda::event_t
+ *
+ * @note obtaining device LUID's is not supported (those are too graphics-specific)
+ * @note This class is a "reference type", not a "value type". Therefore, making changes
+ * to properties of the device is a const-respecting operation on this class.
  */
 class device_t {
 public: // types
 	using properties_t = device::properties_t;
 	using attribute_t = device::attribute_t;
 	using attribute_value_t = device::attribute_value_t;
-	using resource_limit_t = size_t;
 	using shared_memory_bank_size_t = cudaSharedMemConfig;
 	using priority_range_t = std::pair<stream::priority_t, stream::priority_t>;
-	using resource_id_t = cudaLimit;
 
 protected: // types
 	using scoped_setter_t = device::current::detail::scoped_override_t;
@@ -160,6 +172,8 @@ public:	// types
 	 * @brief A class to create a faux member in a @ref device_t, in lieu of an in-class
 	 * namespace (which C++ does not support); whenever you see a function
 	 * `my_dev.memory::foo()`, think of it as a `my_dev::memory::foo()`.
+	 *
+	 * TODO: Should this be made context-specific?
 	 */
 	class global_memory_t {
 	protected:
@@ -295,18 +309,27 @@ public:	// types
 			"Failed disabling access of device " + std::to_string(id()) + " to device " + std::to_string(peer.id()));
 	}
 
+	uuid_t uuid () const {
+		uuid_t result;
+		auto status = cuDeviceGetUuid(&result, id_);
+		throw_if_error(status, "Failed obtaining UUID for device " + device_id_as_str());
+		return result;
+	}
+
 protected:
 	void set_flags(flags_t new_flags)
 	{
 		scoped_setter_t set_device_for_this_scope(id_);
 		auto status = cudaSetDeviceFlags(new_flags);
+			//Not using cuDevicePrimaryCtxSetFlags(id_, new_flags) - althought maybe I could
+		device::current::detail::set(id_);
 		throw_if_error(status, "Failed setting the flags for " + device_id_as_str());
 	}
 
 	void set_flags(
-		host_thread_synch_scheduling_policy_t  synch_scheduling_policy,
-		bool                                   keep_larger_local_mem_after_resize,
-		bool                                   allow_pinned_mapped_memory_allocation)
+		host_thread_synch_scheduling_policy_t  synch_scheduling_policy = heuristic,
+		bool                                   keep_larger_local_mem_after_resize = true,
+		bool                                   allow_pinned_mapped_memory_allocation = false)
 	{
 		set_flags( (flags_t)
 			  synch_scheduling_policy // this enum value is also a valid bitmask
@@ -395,9 +418,9 @@ public:
 	 */
 	device::compute_capability_t compute_capability() const
 	{
-		auto arch = architecture();
+		auto major = architecture();
 		unsigned minor = get_attribute(cudaDevAttrComputeCapabilityMinor);
-		return {arch, minor};
+		return {major, minor};
 	}
 
 	/**
@@ -428,23 +451,28 @@ public:
 	 * resource this device offers.
 	 *
 	 * @param resource which resource's limit to obtain
+	 *
+	 * @todo
 	 */
-	resource_limit_t get_resource_limit(resource_id_t resource) const
+	device::limit_value_t get_limit(device::limit_t limit) const
 	{
-		resource_limit_t limit;
-		auto status = cudaDeviceGetLimit(&limit, resource);
-		throw_if_error(status, "Failed obtaining a resource limit for " + device_id_as_str());
-		return limit;
+//		scoped_setter_t set_device_for_this_scope(id_);
+//		resource_limit_t limit;
+//		auto status = cudaDeviceGetLimit(&limit, resource);
+//		throw_if_error(status, "Failed obtaining a resource limit for " + device_id_as_str());
+//		return limit;
+		return primary_context().get_limit(static_cast<CUlimit>(limit));
 	}
 
 	/**
 	 * Set the upper limit of one of the named numeric resources
 	 * on this device
 	 */
-	void set_resource_limit(resource_id_t resource, resource_limit_t new_limit)
+	void set_limit(device::limit_t limit, device::limit_value_t new_value)
 	{
-		auto status = cudaDeviceSetLimit(resource, new_limit);
-		throw_if_error(status, "Failed setting a resource limit for  " + device_id_as_str());
+//		auto status = cudaDeviceSetLimit(resource, new_limit);
+//		throw_if_error(status, "Failed setting a resource limit for  " + device_id_as_str());
+		primary_context().set_limit(static_cast<CUlimit>(limit), new_value);
 	}
 
 	/**
@@ -479,13 +507,15 @@ public:
 	 * kernels executing on this device.
 	 *
 	 * @param preference the preferred balance between L1 and shared memory
+	 *
 	 */
 	void set_cache_preference(multiprocessor_cache_preference_t preference)
 	{
-		scoped_setter_t set_device_for_this_scope(id_);
-		auto status = cudaDeviceSetCacheConfig((cudaFuncCache) preference);
-		throw_if_error(status,
-			"Setting the multiprocessor L1/Shared Memory cache distribution preference for " + device_id_as_str());
+//		scoped_setter_t set_device_for_this_scope(id_);
+//		auto status = cudaDeviceSetCacheConfig((cudaFuncCache) preference);
+//		throw_if_error(status,
+//			"Setting the multiprocessor L1/Shared Memory cache distribution preference for " + device_id_as_str());
+		primary_context().set_cache_preference(preference);
 	}
 
 	/**
@@ -494,12 +524,13 @@ public:
 	 */
 	multiprocessor_cache_preference_t cache_preference() const
 	{
-		scoped_setter_t set_device_for_this_scope(id_);
-		cudaFuncCache raw_preference;
-		auto status = cudaDeviceGetCacheConfig(&raw_preference);
-		throw_if_error(status,
-			"Obtaining the multiprocessor L1/Shared Memory cache distribution preference for " + device_id_as_str());
-		return (multiprocessor_cache_preference_t) raw_preference;
+//		scoped_setter_t set_device_for_this_scope(id_);
+//		cudaFuncCache raw_preference;
+//		auto status = cudaDeviceGetCacheConfig(&raw_preference);
+//		throw_if_error(status,
+//			"Obtaining the multiprocessor L1/Shared Memory cache distribution preference for " + device_id_as_str());
+//		return (multiprocessor_cache_preference_t) raw_preference;
+		return primary_context().cache_preference();
 	}
 
 	/**
@@ -510,9 +541,10 @@ public:
 	 */
 	void set_shared_memory_bank_size(shared_memory_bank_size_t new_bank_size)
 	{
-		scoped_setter_t set_device_for_this_scope(id_);
-		auto status = cudaDeviceSetSharedMemConfig(new_bank_size);
-		throw_if_error(status, "Setting the multiprocessor shared memory bank size for " + device_id_as_str());
+//		scoped_setter_t set_device_for_this_scope(id_);
+//		auto status = cudaDeviceSetSharedMemConfig(new_bank_size);
+//		throw_if_error(status, "Setting the multiprocessor shared memory bank size for " + device_id_as_str());
+		primary_context().set_shared_memory_bank_size(new_bank_size);
 	}
 
 	/**
@@ -523,11 +555,12 @@ public:
 	 */
 	shared_memory_bank_size_t shared_memory_bank_size() const
 	{
-		scoped_setter_t set_device_for_this_scope(id_);
-		shared_memory_bank_size_t bank_size;
-		auto status = cudaDeviceGetSharedMemConfig(&bank_size);
-		throw_if_error(status, "Obtaining the multiprocessor shared memory bank size for  " + device_id_as_str());
-		return bank_size;
+//		scoped_setter_t set_device_for_this_scope(id_);
+//		shared_memory_bank_size_t bank_size;
+//		auto status = cudaDeviceGetSharedMemConfig(&bank_size);
+//		throw_if_error(status, "Obtaining the multiprocessor shared memory bank size for  " + device_id_as_str());
+//		return bank_size;
+		return primary_context().shared_memory_bank_size();
 	}
 
 	// For some reason, there is no cudaFuncGetCacheConfig. Weird.
@@ -546,6 +579,7 @@ public:
 	}
 
 	stream_t default_stream() const noexcept;
+	device::primary_context_t primary_context() const;
 
 	// I'm a worried about the creation of streams with the assumption
 	// that theirs is the current device, so I'm just forbidding it
@@ -585,14 +619,17 @@ public:
 
 	priority_range_t stream_priority_range() const
 	{
-		scoped_setter_t set_device_for_this_scope(id_);
-		stream::priority_t least, greatest;
-		auto status = cudaDeviceGetStreamPriorityRange(&least, &greatest);
-		throw_if_error(status, "Failed obtaining stream priority range for " + device_id_as_str());
-		return {least, greatest};
+//		scoped_setter_t set_device_for_this_scope(id_);
+//		stream::priority_t least, greatest;
+//		auto status = cudaDeviceGetStreamPriorityRange(&least, &greatest);
+//		throw_if_error(status, "Failed obtaining stream priority range for " + device_id_as_str());
+//		return {least, greatest};
+		return primary_context().stream_priority_range();
 	}
 
 public:
+
+	// TODO: Make the primary context do this (when that's even possible)
 
 	host_thread_synch_scheduling_policy_t synch_scheduling_policy() const
 	{
@@ -655,6 +692,7 @@ public:
 	{
 		enable_mapping_host_memory(false);
 	}
+
 
 public:
 
@@ -727,6 +765,15 @@ inline device_t get(id_t device_id) noexcept
 	return device_t(device_t::wrapping_construction{}, device_id);
 }
 
+/**
+ * A named constructor idiom for a "dummy" CUDA device representing the CPU.
+ *
+ * @note Only use this idiom when comparing the results of functions returning
+ * locations, which can be either a GPU device or the CPU; any other use will likely
+ * result in a runtime error being thrown.
+ */
+inline device_t cpu() { return get(cudaCpuDeviceId); }
+
 namespace current {
 
 /**
@@ -768,6 +815,13 @@ inline device_t get(const std::string& pci_id_str)
 {
 	auto parsed_pci_id = pci_location_t::parse(pci_id_str);
 	return get(parsed_pci_id);
+}
+
+namespace detail {
+
+// For uniformity with other wrapper classes
+inline device_t wrap(device::id_t id) { return device::get(id); }
+
 }
 
 } // namespace device
