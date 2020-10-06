@@ -29,6 +29,7 @@ PROJECT(cuda-api-wrappers
 	LANGUAGES CUDA CXX)
 
 include(FindCUDA)
+include(FindNVRTC)
 include(GNUInstallDirs)
 
 find_package(Threads REQUIRED)
@@ -42,10 +43,11 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "lib/")
 # -------------------
 
 add_library(runtime-and-driver INTERFACE) # A header-only library!
-add_library(nvtx)
-set(wrapper-libraries runtime-and-driver nvtx)
+add_library(nvrtc-wrappers INTERFACE) # A header-only library!
+add_library(nvtx-wrappers)
+set(wrapper-libraries runtime-and-driver nvrtc-wrappers nvtx-wrappers)
 
-foreach(WRAPPER_LIB ${wrapper-libraries})
+foreach(WRAPPER_LIB ${wrapper-libraries} nvrtc-wrappers)
 	target_compile_features(${WRAPPER_LIB} INTERFACE cxx_std_11) # This means _at least_ C++11
 	target_include_directories(
 		${WRAPPER_LIB}
@@ -60,23 +62,24 @@ foreach(WRAPPER_LIB ${wrapper-libraries})
 	target_link_libraries(${WRAPPER_LIB} INTERFACE ${CUDA_LIBRARIES} ${CUDA_CUDA_LIBRARY})
 endforeach()
 
-set_target_properties(nvtx PROPERTIES OUTPUT_NAME "cuda-nvtx-wrappers")
-target_link_libraries(nvtx PUBLIC runtime-and-driver)
-set_property(TARGET nvtx PROPERTY CXX_STANDARD 11)
-set_property(TARGET nvtx PROPERTY CXX_STANDARD_REQUIRED ON)
-set_property(TARGET nvtx PROPERTY CXX_EXTENSIONS OFF)
+set_target_properties(nvtx-wrappers PROPERTIES OUTPUT_NAME "cuda-nvtx-wrappers")
+target_link_libraries(nvtx-wrappers PUBLIC runtime-and-driver)
+set_property(TARGET nvtx-wrappers PROPERTY CXX_STANDARD 11)
+set_property(TARGET nvtx-wrappers PROPERTY CXX_STANDARD_REQUIRED ON)
+set_property(TARGET nvtx-wrappers PROPERTY CXX_EXTENSIONS OFF)
+target_sources(nvtx-wrappers PRIVATE src/cuda/nvtx/profiling.cpp)
 
-target_sources(nvtx PRIVATE src/cuda/nvtx/profiling.cpp)
+target_link_libraries(nvrtc-wrappers INTERFACE nvrtc::nvrtc)
 
 # Note: This is a bit like a poor man's configure.h file;
 # but for two settings I won't bother creating one of those
 if(DEFINED CMAKE_USE_PTHREADS_INIT)
-	target_compile_definitions(nvtx PUBLIC "" "CUDA_API_WRAPPERS_USE_PTHREADS")
+	target_compile_definitions(nvtx-wrappers PUBLIC "" "CUDA_API_WRAPPERS_USE_PTHREADS")
 elseif(DEFINED CMAKE_USE_WIN32_THREADS_INIT)
-	target_compile_definitions(nvtx PUBLIC "" "CUDA_API_WRAPPERS_USE_WIN32_THREADS")
+	target_compile_definitions(nvtx-wrappers PUBLIC "" "CUDA_API_WRAPPERS_USE_WIN32_THREADS")
 endif()
 
-target_link_libraries(nvtx PRIVATE Threads::Threads)
+target_link_libraries(nvtx-wrappers PRIVATE Threads::Threads)
 
 # --------
 # Examples
